@@ -2,7 +2,8 @@
 Clipper Community Bot (slim version)
 Uses your EXISTING channels. On every start the bot checks all embeds/panels
 and posts the ones that are missing. Roles, verification, tickets, applications,
-streamer requests, suggestions with threads, honeypot channel and anti-raid.
+streamer requests, suggestions with threads, honeypot channel, moderation commands,
+auto-moderation, logs and anti-raid.
 Requires: discord.py >= 2.4   |   Env variable: DISCORD_TOKEN
 """
 import asyncio
@@ -13,7 +14,7 @@ import random
 import re
 import time
 import traceback
-from collections import deque
+from collections import defaultdict, deque
 from datetime import timedelta
 from typing import Optional
 
@@ -45,10 +46,45 @@ CHANNEL_NAMES = {
     "applications": (["application"], ["review"]),
     "suggestions": (["suggestion"], []),
     "honeypot": (["do-not-write", "honeypot", "dont-write"], []),
+    "general": (["general"], []),
+    "mod_log": (["mod-log"], ["automod"]),
+    "automod_log": (["automod-log"], []),
+    "member_log": (["member-log"], []),
+    "message_log": (["message-log"], []),
     "ticket_log": (["ticket-log"], []),
     "app_review": (["application-review", "app-review"], []),
     "raid_alerts": (["raid-alert"], []),
 }
+
+# Auto-moderation
+LINK_TIMEOUT = timedelta(hours=3)
+INSULT_TIMEOUT = timedelta(hours=3)
+SPAM_TIMEOUT = timedelta(hours=3)
+ALLOWED_DOMAINS = {"tenor.com", "giphy.com"}   # links from these domains are allowed
+SPAM_MESSAGES = 5        # this many messages ...
+SPAM_WINDOW = 6          # ... within this many seconds
+DUPLICATE_LIMIT = 3      # same message this many times ...
+DUPLICATE_WINDOW = 20    # ... within this many seconds
+MENTION_LIMIT = 6        # mentions in one message
+
+# Mass kick/ban alarm (someone kicks/bans several people in a row)
+RAID_ACTION_LIMIT = 3
+RAID_WINDOW = 60
+AUTO_STRIP_ROLES = False  # True = bot removes dangerous roles from the person who triggered the alarm
+
+# Warning escalation: number of warnings -> automatic timeout
+WARN_ESCALATION = {3: timedelta(hours=6), 5: timedelta(hours=24)}
+
+INSULTS = [
+    "fuck you", "fuck off", "kys", "kill yourself", "go die", "idiot", "moron",
+    "retard", "retarded", "bitch", "cunt", "whore", "slut", "faggot", "fag",
+    "nigger", "nigga", "dumbass", "bastard", "asshole", "dickhead", "shithead",
+    "hurensohn", "hure", "wichser", "fotze", "arschloch", "missgeburt", "spast",
+    "schwuchtel", "behindert", "vollidiot",
+]
+
+# Streamer <-> clipper chats: can staff see these private chats? (recommended for safety)
+CONTACT_STAFF_CAN_SEE = True
 
 # Anti-raid
 JOIN_LIMIT = 8                # this many joins ...
@@ -62,7 +98,8 @@ COLORS = {"brand": 0x5865F2, "ok": 0x57F287, "warn": 0xFEE75C,
 # ============================================================
 # DATA
 # ============================================================
-DEFAULTS = {"channels": {}, "roles": {}, "messages": {}, "jobs": {}, "job_counter": 0, "suggestions": {}}
+DEFAULTS = {"channels": {}, "roles": {}, "messages": {}, "jobs": {}, "job_counter": 0, "suggestions": {},
+            "warnings": {}, "case_counter": 0}
 
 
 def load_data():
@@ -141,6 +178,88 @@ async def try_dm(user, emb):
         return True
     except (discord.Forbidden, discord.HTTPException):
         return False
+
+
+def codeblock(text, n=900):
+    return "```" + truncate(text.replace("```", "'''"), n) + "```"
+
+
+def next_case():
+    data["case_counter"] += 1
+    save_data()
+    return data["case_counter"]
+
+
+def fmt_td(td):
+    s = int(td.total_seconds())
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    parts = [f"{v}{u}" for v, u in ((d, "d"), (h, "h"), (m, "m"), (s, "s")) if v]
+    return " ".join(parts) or "0s"
+
+
+def parse_duration(text):
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd]?)\s*", text.lower())
+    if not m:
+        return None
+    unit = m.group(2) or "m"
+    td = timedelta(seconds=int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit])
+    if td < timedelta(seconds=1) or td > timedelta(days=28):
+        return None
+    return td
+
+
+def case_embed(title, color, case, target, moderator_text, reason, extra=None):
+    e = make_embed(title, color=color)
+    e.add_field(name="User", value=f"{target.mention}\n`{target.id}`")
+    e.add_field(name="Moderator", value=moderator_text)
+    e.add_field(name="Reason", value=truncate(reason, 1000), inline=False)
+    for name, value in extra or []:
+        e.add_field(name=name, value=value)
+    e.set_footer(text=f"Case #{case}")
+    return e
+
+
+def dm_embed(guild, action, reason, extra=None):
+    e = make_embed(f"You were {action} in {guild.name}", color="bad")
+    e.add_field(name="Reason", value=truncate(reason, 1000), inline=False)
+    if extra:
+        e.add_field(name="Details", value=extra, inline=False)
+    return e
+
+
+def hierarchy_error(guild, moderator, target):
+    if target.id == moderator.id:
+        return "You can't do that to yourself."
+    if target.id == guild.owner_id:
+        return "You can't target the server owner."
+    if target.id == bot.user.id:
+        return "I won't do that to myself."
+    if isinstance(target, discord.Member):
+        if moderator.id != guild.owner_id and target.top_role >= moderator.top_role:
+            return "That member has the same or a higher role than you."
+        if target.top_role >= guild.me.top_role:
+            return "I can't moderate that member (their role is higher than mine)."
+    return None
+
+
+async def find_audit(guild, action, target_id, seconds=15):
+    try:
+        await asyncio.sleep(1.5)
+        async for entry in guild.audit_logs(limit=10, action=action):
+            age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+            if entry.target is not None and entry.target.id == target_id and age < seconds:
+                return entry
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return None
+
+
+def is_private_channel(channel):
+    cat = getattr(channel, "category_id", None)
+    return cat is not None and cat in {data["channels"].get("staff_category"),
+                                      data["channels"].get("tickets_category")}
 
 
 background_tasks = set()
@@ -302,6 +421,155 @@ async def enable_raid_mode(guild, reason):
                        "-# Use /raidmode to turn it off earlier.", "bad")
         await send_to(guild, "raid_alerts", e, content=await raid_ping(guild),
                       allowed_mentions=discord.AllowedMentions(roles=True))
+
+
+# ============================================================
+# MASS KICK/BAN ALARM
+# ============================================================
+action_log = defaultdict(deque)
+
+
+async def record_action(guild, executor, group, description):
+    if executor is None or executor.id == bot.user.id:
+        return
+    now = time.time()
+    dq = action_log[(executor.id, group)]
+    dq.append((now, description))
+    while dq and now - dq[0][0] > RAID_WINDOW:
+        dq.popleft()
+    if len(dq) >= RAID_ACTION_LIMIT:
+        items = [d for _, d in dq]
+        dq.clear()
+        await mass_action_alert(guild, executor, group, items)
+
+
+async def mass_action_alert(guild, executor, group, items):
+    e = make_embed("🚨 RAID ALERT: Mass Action Detected", color="bad")
+    e.add_field(name="Responsible", value=f"{executor.mention}\n`{executor.id}`")
+    e.add_field(name="Type", value=group.title())
+    e.add_field(name="Actions", value=truncate("\n".join(f"• {i}" for i in items), 1000), inline=False)
+    e.add_field(name="Window", value=f"{len(items)} actions in under {RAID_WINDOW}s")
+    result = "No automatic action taken."
+    member = guild.get_member(executor.id)
+    if AUTO_STRIP_ROLES and member and member.id != guild.owner_id:
+        risky = [r for r in member.roles if not r.is_default() and not r.managed and r < guild.me.top_role
+                 and (r.permissions.administrator or r.permissions.kick_members or r.permissions.ban_members
+                      or r.permissions.manage_channels or r.permissions.manage_roles)]
+        try:
+            if risky:
+                await member.remove_roles(*risky, reason="Raid alert: mass action detected")
+                result = "Removed roles: " + ", ".join(r.name for r in risky)
+        except discord.HTTPException:
+            result = "Tried to remove roles but failed."
+    e.add_field(name="Automatic action", value=result, inline=False)
+    await send_to(guild, "raid_alerts", e, content=await raid_ping(guild),
+                  allowed_mentions=discord.AllowedMentions(roles=True, users=True))
+    await send_to(guild, "mod_log", e)
+
+
+# ============================================================
+# AUTO-MODERATION
+# ============================================================
+BARE_LINK_RE = re.compile(
+    r"\b((?:[a-z0-9-]+\.)+(?:com|net|org|gg|io|xyz|co|tv|me|ly|link|click|ru|de|info|shop|site|online|"
+    r"app|dev|to|cc|ws|top|club|live|stream|store|fun|icu|vip|pw|tk|ml|ga|cf|gq|ink|page|cloud))\b", re.I)
+URL_RE = re.compile(r"https?://([^\s/]+)", re.I)
+LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+
+
+def _build_pattern(words):
+    parts = [r"\s+".join(map(re.escape, w.split())) for w in words]
+    return re.compile(r"(?<![a-z])(?:" + "|".join(parts) + r")(?:s|es)?(?![a-z])")
+
+
+INSULT_RE = _build_pattern(INSULTS)
+
+
+def has_blocked_link(text):
+    hosts = [m.group(1).lower() for m in URL_RE.finditer(text)]
+    hosts += [m.group(1).lower() for m in BARE_LINK_RE.finditer(text)]
+    for h in hosts:
+        if not any(h == d or h.endswith("." + d) for d in ALLOWED_DOMAINS):
+            return True
+    return False
+
+
+def has_insult(text):
+    t = text.lower().translate(LEET)
+    t = re.sub(r"(.)\1{2,}", r"\1", t)
+    return INSULT_RE.search(t) is not None
+
+
+spam_tracker = defaultdict(lambda: deque(maxlen=20))
+bot_deleted = set()
+
+
+def check_spam(message):
+    now = time.time()
+    content = message.content.strip().lower()
+    dq = spam_tracker[message.author.id]
+    dq.append((now, content, message))
+    recent = [x for x in dq if now - x[0] <= SPAM_WINDOW]
+    if len(recent) >= SPAM_MESSAGES:
+        return f"Spam ({len(recent)} messages in {SPAM_WINDOW} seconds)", [x[2] for x in recent]
+    if content:
+        dup = [x for x in dq if now - x[0] <= DUPLICATE_WINDOW and x[1] == content]
+        if len(dup) >= DUPLICATE_LIMIT:
+            return "Spam (repeated messages)", [x[2] for x in dup]
+    if len(message.mentions) + len(message.role_mentions) >= MENTION_LIMIT:
+        return "Mass mentions", [message]
+    return None, []
+
+
+async def punish(message, reason, label, duration, extra=()):
+    member, guild = message.author, message.guild
+    for m in {message.id: message, **{x.id: x for x in extra}}.values():
+        bot_deleted.add(m.id)
+        try:
+            await m.delete()
+        except discord.HTTPException:
+            pass
+    spam_tracker.pop(member.id, None)
+    timed_out = False
+    try:
+        await member.timeout(duration, reason=f"AutoMod: {reason}")
+        timed_out = True
+    except discord.HTTPException:
+        pass
+    case = next_case()
+    note = f"{member.mention}, your message was removed: **{reason}**."
+    if timed_out:
+        note += f" You have been timed out for **{fmt_td(duration)}**."
+    try:
+        await message.channel.send(note, delete_after=10)
+    except discord.HTTPException:
+        pass
+    await try_dm(member, dm_embed(guild, "timed out by AutoMod" if timed_out else "warned by AutoMod", reason,
+                                  f"Duration: {fmt_td(duration)}" if timed_out else None))
+    e = case_embed(f"AutoMod: {label}", "bad", case, member, "AutoMod", reason,
+                   [("Channel", message.channel.mention),
+                    ("Punishment", f"Timeout {fmt_td(duration)}" if timed_out else "Message removed (timeout failed)")])
+    if message.content:
+        e.add_field(name="Message", value=codeblock(message.content), inline=False)
+    await send_to(guild, "automod_log", e)
+
+
+async def run_automod(message):
+    member = message.author
+    if not isinstance(member, discord.Member) or is_staff(member) or is_private_channel(message.channel):
+        return False
+    text = message.content or ""
+    if text and has_blocked_link(text):
+        await punish(message, "Links are not allowed", "Link", LINK_TIMEOUT)
+        return True
+    if text and has_insult(text):
+        await punish(message, "Insults / offensive language", "Insult", INSULT_TIMEOUT)
+        return True
+    reason, msgs = check_spam(message)
+    if reason:
+        await punish(message, reason, "Spam", SPAM_TIMEOUT, msgs)
+        return True
+    return False
 
 
 # ============================================================
@@ -478,10 +746,19 @@ class TicketView(discord.ui.View):
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         channel = interaction.channel
         topic = channel.topic or ""
-        owner_id = int(topic.split(":")[1]) if topic.startswith("ticket:") else None
-        if not (is_staff(interaction.user) or interaction.user.id == owner_id):
-            return await interaction.response.send_message("Only the ticket owner or staff can close this.", ephemeral=True)
-        await interaction.response.send_message("🔒 Closing this ticket in 5 seconds…")
+        try:
+            if topic.startswith("ticket:"):
+                participants = [int(topic.split(":")[1])]
+            elif topic.startswith("contact:"):
+                participants = [int(x) for x in topic.split(":")[1:3]]
+            else:
+                participants = []
+        except ValueError:
+            participants = []
+        owner_id = participants[0] if participants else None
+        if not (is_staff(interaction.user) or interaction.user.id in participants):
+            return await interaction.response.send_message("Only the people in this chat or staff can close it.", ephemeral=True)
+        await interaction.response.send_message("🔒 Closing this chat in 5 seconds…")
         lines = []
         async for m in channel.history(limit=1000, oldest_first=True):
             lines.append(f"[{m.created_at:%Y-%m-%d %H:%M}] {m.author}: {m.clean_content}")
@@ -489,8 +766,8 @@ class TicketView(discord.ui.View):
         e = make_embed("Ticket Closed", color="bad")
         e.add_field(name="Ticket", value=f"`{channel.name}`")
         e.add_field(name="Closed by", value=interaction.user.mention)
-        if owner_id:
-            e.add_field(name="Owner", value=f"<@{owner_id}>")
+        if participants:
+            e.add_field(name="Participants", value=" ".join(f"<@{p}>" for p in participants))
         await send_to(interaction.guild, "ticket_log", e, file=file)
         await asyncio.sleep(5)
         try:
@@ -694,6 +971,19 @@ async def refresh_application_panel(guild):
 streamer_cooldown = {}
 
 
+PLATFORMS = {"Twitch": ("🟣", 0x9146FF), "YouTube": ("🔴", 0xFF0000), "Kick": ("🟢", 0x53FC18),
+             "TikTok": ("⚫", 0x25F4EE), "Other": ("⚪", 0x5865F2)}
+
+
+def normalize_link(text):
+    t = (text or "").strip()
+    if re.fullmatch(r"https?://\S+\.\S+", t):
+        return t[:500]
+    if re.fullmatch(r"[\w.-]+\.[a-z]{2,}(/\S*)?", t, re.I):
+        return ("https://" + t)[:500]
+    return None
+
+
 class StreamerModal(discord.ui.Modal, title="Clipper Search Request"):
     topic = discord.ui.TextInput(label="Streaming topic", placeholder="e.g. Just Chatting, Valorant, IRL", max_length=100)
     about = discord.ui.TextInput(label="About you", style=discord.TextStyle.paragraph, max_length=1000,
@@ -715,20 +1005,78 @@ class StreamerModal(discord.ui.Modal, title="Clipper Search Request"):
             return await interaction.response.send_message(
                 "The submission channel could not be found. Please contact the team.", ephemeral=True)
         user = interaction.user
-        e = make_embed("🎥 New Clipper Search Request", color="brand")
+        emoji, color = PLATFORMS.get(self.platform, PLATFORMS["Other"])
+        quote = "\n".join("> " + ln for ln in truncate(self.about.value, 900).splitlines() if ln.strip()) or "> –"
+        url = normalize_link(self.social.value)
+        e = discord.Embed(title=f"🎥 {user.display_name} is looking for clippers!",
+                          description=f"### {emoji} {self.platform}  •  {truncate(self.topic.value, 100)}\n{quote}",
+                          color=color, timestamp=discord.utils.utcnow())
         e.set_author(name=str(user), icon_url=user.display_avatar.url)
         e.set_thumbnail(url=user.display_avatar.url)
-        e.add_field(name="Streamer", value=f"{user.mention}\n`{user.id}`")
-        e.add_field(name="Platform", value=self.platform)
-        e.add_field(name="Streaming topic", value=self.topic.value)
-        e.add_field(name="Social media", value=truncate(self.social.value, 200), inline=False)
-        e.add_field(name="About", value=truncate(self.about.value, 1000), inline=False)
-        e.add_field(name="Payment / rewards for clippers", value=truncate(self.rewards.value, 1000), inline=False)
-        e.add_field(name="Further requirements", value=truncate(self.requirements.value or "None", 1000), inline=False)
-        e.set_footer(text=f"User ID: {user.id}")
-        await ch.send(embed=e)
+        e.add_field(name="💰 Payment & rewards", value=truncate(self.rewards.value, 1000), inline=False)
+        e.add_field(name="📋 Requirements", value=truncate(self.requirements.value or "None", 1000), inline=False)
+        e.add_field(name="🔗 Social media",
+                    value=f"[{truncate(self.social.value, 60)}]({url})" if url else truncate(self.social.value, 200))
+        e.add_field(name="👤 Streamer", value=user.mention)
+        e.set_footer(text=f"Press the button below to get in touch • User ID: {user.id}")
+        await ch.send(embed=e, view=ContactView(url))
         streamer_cooldown[user.id] = time.time()
-        await interaction.response.send_message("✅ Your request was sent! Our team will take a look at it.", ephemeral=True)
+        await interaction.response.send_message("✅ Your request was sent! Clippers can now contact you.", ephemeral=True)
+
+
+class ContactView(discord.ui.View):
+    """Button under every streamer request: opens a private channel for streamer + clipper."""
+
+    def __init__(self, link=None):
+        super().__init__(timeout=None)
+        if link:
+            self.add_item(discord.ui.Button(label="Open Social Media", emoji="🔗", style=discord.ButtonStyle.link, url=link))
+
+    @discord.ui.button(label="Contact Streamer", style=discord.ButtonStyle.success, emoji="🤝", custom_id="streamer:contact")
+    async def contact(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild, clicker = interaction.guild, interaction.user
+        try:
+            streamer_id = int(interaction.message.embeds[0].footer.text.rsplit("User ID:", 1)[1].strip())
+        except (IndexError, ValueError, AttributeError):
+            return await interaction.response.send_message("I couldn't read this request.", ephemeral=True)
+        if clicker.id == streamer_id:
+            return await interaction.response.send_message("That's your own request. 😉", ephemeral=True)
+        streamer = guild.get_member(streamer_id)
+        if not streamer:
+            return await interaction.response.send_message("This streamer is no longer on the server.", ephemeral=True)
+        cat = get_chan(guild, "tickets_category")
+        if not cat:
+            return await interaction.response.send_message("Contact channels aren't ready yet.", ephemeral=True)
+        topic = f"contact:{streamer_id}:{clicker.id}"
+        for c in cat.text_channels:
+            if c.topic == topic:
+                return await interaction.response.send_message(f"You already have a chat with them: {c.mention}",
+                                                               ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        P = discord.PermissionOverwrite
+        ow = {guild.default_role: P(view_channel=False),
+              guild.me: P(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)}
+        for m in (streamer, clicker):
+            ow[m] = P(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+        if CONTACT_STAFF_CAN_SEE:
+            for r in (get_role(guild, "staff"), get_role(guild, "high_team")):
+                if r:
+                    ow[r] = P(view_channel=True, send_messages=True, read_message_history=True)
+        clean = lambda n: re.sub(r"[^a-z0-9]", "", n.lower()) or "user"
+        channel = await guild.create_text_channel(f"deal-{clean(streamer.name)}-{clean(clicker.name)}"[:90],
+                                                  category=cat, overwrites=ow, topic=topic)
+        intro = make_embed("🤝 Streamer ↔ Clipper",
+                           f"{streamer.mention} and {clicker.mention}, this private channel is for you two to clarify "
+                           "everything: payment, requirements, schedule and more.\n"
+                           "-# Be respectful and never share passwords. Use the button below to close this chat.", "ok")
+        await channel.send(content=f"{streamer.mention} {clicker.mention}", embeds=[intro, interaction.message.embeds[0]],
+                           view=TicketView(), allowed_mentions=discord.AllowedMentions(users=True))
+        await interaction.followup.send(f"✅ Your chat is ready: {channel.mention}", ephemeral=True)
+        le = make_embed("Contact Channel Opened", color="info")
+        le.add_field(name="Streamer", value=streamer.mention)
+        le.add_field(name="Clipper", value=clicker.mention)
+        le.add_field(name="Channel", value=channel.mention)
+        await send_to(guild, "ticket_log", le)
 
 
 class PlatformSelect(discord.ui.Select):
@@ -803,6 +1151,8 @@ async def handle_suggestion(message):
         pass
     try:
         await message.delete()
+    except discord.NotFound:
+        return  # already handled (e.g. by a second running instance of the bot)
     except discord.HTTPException:
         pass
     if not content and not files:
@@ -825,6 +1175,59 @@ async def handle_suggestion(message):
 
 
 # ============================================================
+# AUTO-CREATED CHANNELS (only if missing): honeypot + staff logs
+# ============================================================
+SPECIAL_CHANNELS = [
+    ("mod_log", "🛡️｜mod-log", "staff"),
+    ("automod_log", "🤖｜automod-log", "staff"),
+    ("member_log", "👥｜member-log", "staff"),
+    ("message_log", "💬｜message-log", "staff"),
+    ("raid_alerts", "🚨｜raid-alerts", "staff"),
+    ("ticket_log", "🎫｜ticket-log", "staff"),
+    ("app_review", "📋｜application-review", "staff"),
+    ("honeypot", "🚫｜do-not-write", "honeypot"),
+]
+
+
+async def ensure_special_channels(guild):
+    P = discord.PermissionOverwrite
+    staff, high, ver = get_role(guild, "staff"), get_role(guild, "high_team"), get_role(guild, "verified")
+    me = P(view_channel=True, send_messages=True, embed_links=True, manage_messages=True, read_message_history=True,
+           manage_channels=True, create_public_threads=True, send_messages_in_threads=True)
+    staff_ow = {guild.default_role: P(view_channel=False), guild.me: me}
+    for r in (staff, high):
+        if r:
+            staff_ow[r] = P(view_channel=True, send_messages=True, read_message_history=True)
+    staff_cat = next((c for c in guild.categories if c.name.lower() == "staff"), None)
+    for key, name, mode in SPECIAL_CHANNELS:
+        if get_chan(guild, key):
+            continue
+        try:
+            if mode == "staff":
+                if staff_cat is None:
+                    staff_cat = await guild.create_category("STAFF", overwrites=staff_ow)
+                await guild.create_text_channel(name, category=staff_cat, overwrites=staff_ow)
+            else:
+                ow = {guild.default_role: P(view_channel=False), guild.me: me}
+                if ver:
+                    ow[ver] = P(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
+                ref = get_chan(guild, "general")
+                await guild.create_text_channel(name, category=ref.category if ref else None, overwrites=ow)
+            print(f"[{guild.name}] created channel {name}")
+        except discord.HTTPException as e:
+            print(f"[{guild.name}] could not create {name}: {e}")
+    if staff_cat:
+        data["channels"]["staff_category"] = staff_cat.id
+        save_data()
+
+
+async def prepare_guild(guild):
+    await ensure_roles(guild)
+    await ensure_special_channels(guild)
+    await ensure_all_panels(guild)
+
+
+# ============================================================
 # BOT
 # ============================================================
 class ClipperBot(commands.Bot):
@@ -838,7 +1241,7 @@ class ClipperBot(commands.Bot):
 
     async def setup_hook(self):
         for v in (VerifyView(), RolesView(), SupportView(), TicketView(), ReviewView(),
-                  SuggestionView(), StreamerPanelView()):
+                  SuggestionView(), StreamerPanelView(), ContactView()):
             self.add_view(v)
         self.add_dynamic_items(ApplyButton)
 
@@ -858,7 +1261,7 @@ async def on_ready():
             await sync_guild(g)
         bot.synced = True
         for g in bot.guilds:
-            await ensure_all_panels(g)
+            await prepare_guild(g)
         try:  # bot profile "About Me"
             await bot.http.request(discord.http.Route("PATCH", "/applications/@me"), json={"description": BOT_ABOUT})
         except Exception as e:
@@ -869,7 +1272,7 @@ async def on_ready():
 @bot.event
 async def on_guild_join(guild):
     await sync_guild(guild)
-    await ensure_all_panels(guild)
+    await prepare_guild(guild)
 
 
 @bot.tree.error
@@ -963,11 +1366,251 @@ async def raidmode(interaction: discord.Interaction, enabled: bool):
 
 
 # ============================================================
+# MODERATION COMMANDS
+# ============================================================
+def mod_command(name, description, perm):
+    def deco(func):
+        func = app_commands.guild_only()(func)
+        func = app_commands.checks.has_permissions(**{perm: True})(func)
+        func = app_commands.default_permissions(**{perm: True})(func)
+        return bot.tree.command(name=name, description=description)(func)
+    return deco
+
+
+@mod_command("warn", "Warn a member", "moderate_members")
+@app_commands.describe(member="Member to warn", reason="Reason for the warning")
+async def warn_cmd(interaction: discord.Interaction, member: discord.Member, reason: str):
+    err = hierarchy_error(interaction.guild, interaction.user, member)
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    case = next_case()
+    warns = data["warnings"].setdefault(str(member.id), [])
+    warns.append({"case": case, "reason": reason, "mod": interaction.user.id, "time": int(time.time())})
+    save_data()
+    count = len(warns)
+    await try_dm(member, dm_embed(interaction.guild, "warned", reason, f"Total warnings: {count}"))
+    e = case_embed("Member Warned", "warn", case, member, interaction.user.mention, reason,
+                   [("Total warnings", str(count))])
+    await interaction.response.send_message(embed=e)
+    await send_to(interaction.guild, "mod_log", e)
+    if count in WARN_ESCALATION:
+        dur = WARN_ESCALATION[count]
+        try:
+            await member.timeout(dur, reason=f"Reached {count} warnings")
+            e2 = case_embed("Automatic Timeout", "bad", next_case(), member, "AutoMod",
+                            f"Reached {count} warnings", [("Duration", fmt_td(dur))])
+            await send_to(interaction.guild, "mod_log", e2)
+            await interaction.followup.send(f"⚠️ {member.mention} reached **{count}** warnings and was timed out for "
+                                            f"**{fmt_td(dur)}**.")
+        except discord.HTTPException:
+            pass
+
+
+@mod_command("warnings", "Show the warnings of a member", "moderate_members")
+@app_commands.describe(member="Member to check")
+async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
+    warns = data["warnings"].get(str(member.id), [])
+    e = make_embed(f"Warnings for {member}", color="warn")
+    if not warns:
+        e.description = "No warnings."
+    for w in warns[-10:]:
+        e.add_field(name=f"Case #{w['case']} • <t:{w['time']}:R>",
+                    value=f"{truncate(w['reason'], 300)}\n-# by <@{w['mod']}>", inline=False)
+    e.set_footer(text=f"Total: {len(warns)}")
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@mod_command("clearwarnings", "Remove all warnings of a member", "manage_guild")
+@app_commands.describe(member="Member whose warnings should be cleared")
+async def clearwarnings(interaction: discord.Interaction, member: discord.Member):
+    n = len(data["warnings"].pop(str(member.id), []))
+    save_data()
+    await interaction.response.send_message(f"Cleared {n} warning(s) for {member.mention}.")
+    e = make_embed("Warnings Cleared", color="ok")
+    e.add_field(name="User", value=f"{member.mention}\n`{member.id}`")
+    e.add_field(name="Moderator", value=interaction.user.mention)
+    e.add_field(name="Cleared", value=str(n))
+    await send_to(interaction.guild, "mod_log", e)
+
+
+@mod_command("kick", "Kick a member", "kick_members")
+@app_commands.describe(member="Member to kick", reason="Reason")
+async def kick_cmd(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    err = hierarchy_error(interaction.guild, interaction.user, member)
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    case = next_case()
+    await try_dm(member, dm_embed(interaction.guild, "kicked", reason))
+    try:
+        await member.kick(reason=f"[{interaction.user}] {reason}")
+    except discord.HTTPException:
+        return await interaction.response.send_message("I couldn't kick that member.", ephemeral=True)
+    e = case_embed("Member Kicked", "warn", case, member, interaction.user.mention, reason)
+    await interaction.response.send_message(embed=e)
+    await send_to(interaction.guild, "mod_log", e)
+    await record_action(interaction.guild, interaction.user, "member removal", f"Kicked {member} (`{member.id}`)")
+
+
+@mod_command("ban", "Ban a user", "ban_members")
+@app_commands.describe(user="User to ban", reason="Reason", delete_days="Delete their messages of the last X days (0-7)")
+async def ban_cmd(interaction: discord.Interaction, user: discord.User, reason: str = "No reason provided",
+                  delete_days: app_commands.Range[int, 0, 7] = 0):
+    guild = interaction.guild
+    member = guild.get_member(user.id)
+    err = hierarchy_error(guild, interaction.user, member or user)
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    case = next_case()
+    await try_dm(user, dm_embed(guild, "banned", reason))
+    try:
+        await guild.ban(user, reason=f"[{interaction.user}] {reason}", delete_message_seconds=delete_days * 86400)
+    except discord.HTTPException:
+        return await interaction.response.send_message("I couldn't ban that user.", ephemeral=True)
+    e = case_embed("Member Banned", "bad", case, user, interaction.user.mention, reason,
+                   [("Messages deleted", f"{delete_days} day(s)")])
+    await interaction.response.send_message(embed=e)
+    await send_to(guild, "mod_log", e)
+    await record_action(guild, interaction.user, "member removal", f"Banned {user} (`{user.id}`)")
+
+
+@mod_command("unban", "Unban a user by ID", "ban_members")
+@app_commands.describe(user_id="The ID of the banned user", reason="Reason")
+async def unban_cmd(interaction: discord.Interaction, user_id: str, reason: str = "No reason provided"):
+    if not user_id.isdigit():
+        return await interaction.response.send_message("Please provide a valid user ID.", ephemeral=True)
+    try:
+        await interaction.guild.unban(discord.Object(id=int(user_id)), reason=f"[{interaction.user}] {reason}")
+    except discord.NotFound:
+        return await interaction.response.send_message("That user is not banned.", ephemeral=True)
+    case = next_case()
+    try:
+        user = await bot.fetch_user(int(user_id))
+    except discord.HTTPException:
+        user = discord.Object(id=int(user_id))
+        user.mention = f"<@{user_id}>"
+    e = case_embed("Member Unbanned", "ok", case, user, interaction.user.mention, reason)
+    await interaction.response.send_message(embed=e)
+    await send_to(interaction.guild, "mod_log", e)
+
+
+@mod_command("timeout", "Timeout a member", "moderate_members")
+@app_commands.describe(member="Member to timeout", duration="e.g. 30m, 2h, 1d (max 28d)", reason="Reason")
+async def timeout_cmd(interaction: discord.Interaction, member: discord.Member, duration: str,
+                      reason: str = "No reason provided"):
+    err = hierarchy_error(interaction.guild, interaction.user, member)
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    td = parse_duration(duration)
+    if not td:
+        return await interaction.response.send_message("Invalid duration. Use e.g. `30m`, `2h` or `1d` (max 28d).",
+                                                       ephemeral=True)
+    try:
+        await member.timeout(td, reason=f"[{interaction.user}] {reason}")
+    except discord.HTTPException:
+        return await interaction.response.send_message("I couldn't timeout that member.", ephemeral=True)
+    case = next_case()
+    await try_dm(member, dm_embed(interaction.guild, "timed out", reason, f"Duration: {fmt_td(td)}"))
+    e = case_embed("Member Timed Out", "warn", case, member, interaction.user.mention, reason,
+                   [("Duration", fmt_td(td))])
+    await interaction.response.send_message(embed=e)
+    await send_to(interaction.guild, "mod_log", e)
+
+
+@mod_command("untimeout", "Remove a timeout", "moderate_members")
+@app_commands.describe(member="Member to release")
+async def untimeout_cmd(interaction: discord.Interaction, member: discord.Member):
+    try:
+        await member.timeout(None, reason=f"[{interaction.user}] timeout removed")
+    except discord.HTTPException:
+        return await interaction.response.send_message("I couldn't remove that timeout.", ephemeral=True)
+    case = next_case()
+    e = case_embed("Timeout Removed", "ok", case, member, interaction.user.mention, "Timeout removed manually")
+    await interaction.response.send_message(embed=e)
+    await send_to(interaction.guild, "mod_log", e)
+
+
+@mod_command("purge", "Delete multiple messages", "manage_messages")
+@app_commands.describe(amount="How many messages (1-100)", member="Only delete messages of this member")
+async def purge_cmd(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100],
+                    member: Optional[discord.Member] = None):
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(
+        limit=amount, check=(lambda m: m.author.id == member.id) if member else (lambda m: True))
+    await interaction.followup.send(f"🧹 Deleted {len(deleted)} message(s).", ephemeral=True)
+    e = make_embed("Messages Purged", color="warn")
+    e.add_field(name="Channel", value=interaction.channel.mention)
+    e.add_field(name="Amount", value=str(len(deleted)))
+    e.add_field(name="Moderator", value=interaction.user.mention)
+    if member:
+        e.add_field(name="Filtered by", value=member.mention)
+    await send_to(interaction.guild, "mod_log", e)
+
+
+@mod_command("slowmode", "Set the slowmode of this channel", "manage_channels")
+@app_commands.describe(seconds="0 turns slowmode off (max 21600)")
+async def slowmode_cmd(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 21600]):
+    await interaction.channel.edit(slowmode_delay=seconds, reason=f"[{interaction.user}] slowmode")
+    await interaction.response.send_message(f"⏱️ Slowmode set to **{seconds}s**.")
+    e = make_embed("Slowmode Changed", color="info")
+    e.add_field(name="Channel", value=interaction.channel.mention)
+    e.add_field(name="Delay", value=f"{seconds}s")
+    e.add_field(name="Moderator", value=interaction.user.mention)
+    await send_to(interaction.guild, "mod_log", e)
+
+
+async def set_lock(interaction, locked, channel):
+    channel = channel or interaction.channel
+    ver = get_role(interaction.guild, "verified")
+    ow = channel.overwrites_for(ver)
+    ow.send_messages = False if locked else True
+    await channel.set_permissions(ver, overwrite=ow, reason=f"[{interaction.user}] {'lock' if locked else 'unlock'}")
+    await interaction.response.send_message(f"{'🔒 Locked' if locked else '🔓 Unlocked'} {channel.mention}.")
+    e = make_embed("Channel Locked" if locked else "Channel Unlocked", color="warn" if locked else "ok")
+    e.add_field(name="Channel", value=channel.mention)
+    e.add_field(name="Moderator", value=interaction.user.mention)
+    await send_to(interaction.guild, "mod_log", e)
+
+
+@mod_command("lock", "Lock a chat channel for members", "manage_channels")
+@app_commands.describe(channel="Channel to lock (default: this one)")
+async def lock_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    await set_lock(interaction, True, channel)
+
+
+@mod_command("unlock", "Unlock a chat channel for members", "manage_channels")
+@app_commands.describe(channel="Channel to unlock (default: this one)")
+async def unlock_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    await set_lock(interaction, False, channel)
+
+
+@mod_command("userinfo", "Show information about a member", "moderate_members")
+@app_commands.describe(member="Member to look up")
+async def userinfo_cmd(interaction: discord.Interaction, member: discord.Member):
+    e = make_embed(str(member), color="info")
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="ID", value=f"`{member.id}`")
+    e.add_field(name="Account created", value=discord.utils.format_dt(member.created_at, "R"))
+    e.add_field(name="Joined", value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "?")
+    e.add_field(name="Warnings", value=str(len(data["warnings"].get(str(member.id), []))))
+    roles = [r.mention for r in member.roles if not r.is_default()]
+    e.add_field(name="Roles", value=truncate(" ".join(roles) or "None", 1000), inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+# ============================================================
 # EVENTS
 # ============================================================
 @bot.event
 async def on_member_join(member):
     guild = member.guild
+    je = make_embed("Member Joined", f"{member.mention} joined the server.", "ok")
+    je.set_thumbnail(url=member.display_avatar.url)
+    je.add_field(name="Account created", value=discord.utils.format_dt(member.created_at, "R"))
+    je.add_field(name="Member count", value=str(guild.member_count))
+    if (discord.utils.utcnow() - member.created_at).days < 7:
+        je.add_field(name="⚠️ New account", value="Created less than 7 days ago", inline=False)
+    je.set_footer(text=f"ID: {member.id}")
+    await send_to(guild, "member_log", je)
     now = time.time()
     join_times.append(now)
     while join_times and now - join_times[0] > JOIN_WINDOW:
@@ -1017,6 +1660,7 @@ async def on_message(message):
     if hp and message.channel.id == hp.id:
         if isinstance(member, discord.Member) and is_staff(member):
             return
+        bot_deleted.add(message.id)
         try:
             await message.delete()
         except discord.HTTPException:
@@ -1036,11 +1680,163 @@ async def on_message(message):
                     inline=False)
         await send_to(guild, "raid_alerts", e, content=await raid_ping(guild),
                       allowed_mentions=discord.AllowedMentions(roles=True))
+        await send_to(guild, "mod_log", e)
         return
 
+    if await run_automod(message):
+        return
     sugg = get_chan(guild, "suggestions")
     if sugg and message.channel.id == sugg.id:
         await handle_suggestion(message)
+
+
+@bot.event
+async def on_member_remove(member):
+    guild = member.guild
+    e = make_embed("Member Left", f"{member.mention} (`{member}`) left the server.", "warn")
+    if member.joined_at:
+        e.add_field(name="Joined", value=discord.utils.format_dt(member.joined_at, "R"))
+    roles = [r.mention for r in member.roles if not r.is_default()]
+    if roles:
+        e.add_field(name="Roles", value=truncate(" ".join(roles), 900), inline=False)
+    e.set_footer(text=f"ID: {member.id}")
+    await send_to(guild, "member_log", e)
+    entry = await find_audit(guild, discord.AuditLogAction.kick, member.id)
+    if entry and entry.user and entry.user.id != bot.user.id:
+        ke = case_embed("Member Kicked", "warn", next_case(), member, entry.user.mention,
+                        entry.reason or "No reason provided")
+        await send_to(guild, "mod_log", ke)
+        await record_action(guild, entry.user, "member removal", f"Kicked {member} (`{member.id}`)")
+
+
+@bot.event
+async def on_member_ban(guild, user):
+    entry = await find_audit(guild, discord.AuditLogAction.ban, user.id)
+    if entry and entry.user and entry.user.id == bot.user.id:
+        return  # already logged by the command
+    executor = entry.user if entry else None
+    e = case_embed("Member Banned", "bad", next_case(), user, executor.mention if executor else "Unknown",
+                   (entry.reason if entry and entry.reason else "No reason provided"))
+    await send_to(guild, "mod_log", e)
+    if executor:
+        await record_action(guild, executor, "member removal", f"Banned {user} (`{user.id}`)")
+
+
+@bot.event
+async def on_member_unban(guild, user):
+    entry = await find_audit(guild, discord.AuditLogAction.unban, user.id)
+    if entry and entry.user and entry.user.id == bot.user.id:
+        return
+    e = case_embed("Member Unbanned", "ok", next_case(), user, entry.user.mention if entry else "Unknown",
+                   (entry.reason if entry and entry.reason else "No reason provided"))
+    await send_to(guild, "mod_log", e)
+
+
+@bot.event
+async def on_member_update(before, after):
+    guild = after.guild
+    if before.timed_out_until != after.timed_out_until:
+        entry = await find_audit(guild, discord.AuditLogAction.member_update, after.id)
+        if not (entry and entry.user and entry.user.id == bot.user.id):
+            active = after.timed_out_until and after.timed_out_until > discord.utils.utcnow()
+            e = case_embed("Member Timed Out" if active else "Timeout Removed", "warn" if active else "ok",
+                           next_case(), after, entry.user.mention if entry and entry.user else "Unknown",
+                           (entry.reason if entry and entry.reason else "No reason provided"),
+                           [("Until", discord.utils.format_dt(after.timed_out_until, "R"))] if active else None)
+            await send_to(guild, "mod_log", e)
+    ignore = {r.id for k in ("unverified", "verified", "announcements", "search_clipper", "tips", "application_ping")
+              if (r := get_role(guild, k))}
+    added = [r for r in set(after.roles) - set(before.roles) if r.id not in ignore]
+    removed = [r for r in set(before.roles) - set(after.roles) if r.id not in ignore]
+    if added or removed:
+        e = make_embed("Roles Updated", f"Member: {after.mention}", "info")
+        if added:
+            e.add_field(name="Added", value=" ".join(r.mention for r in added))
+        if removed:
+            e.add_field(name="Removed", value=" ".join(r.mention for r in removed))
+        e.set_footer(text=f"ID: {after.id}")
+        await send_to(guild, "mod_log", e)
+    if before.nick != after.nick:
+        e = make_embed("Nickname Changed", f"Member: {after.mention}", "info")
+        e.add_field(name="Before", value=before.nick or "None")
+        e.add_field(name="After", value=after.nick or "None")
+        await send_to(guild, "member_log", e)
+
+
+@bot.event
+async def on_message_edit(before, after):
+    if after.author.bot or not after.guild:
+        return
+    if await run_automod(after):
+        return
+    if before.content == after.content or is_private_channel(after.channel):
+        return
+    e = make_embed("Message Edited", f"{after.author.mention} in {after.channel.mention} • [Jump]({after.jump_url})", "info")
+    e.add_field(name="Before", value=codeblock(before.content or "(unknown)"), inline=False)
+    e.add_field(name="After", value=codeblock(after.content or "(empty)"), inline=False)
+    await send_to(after.guild, "message_log", e)
+
+
+@bot.event
+async def on_message_delete(message):
+    if not message.guild or message.author.bot:
+        return
+    if message.id in bot_deleted:
+        bot_deleted.discard(message.id)
+        return
+    if is_private_channel(message.channel) or (not message.content and not message.attachments):
+        return
+    e = make_embed("Message Deleted", f"{message.author.mention} in {message.channel.mention}", "bad")
+    if message.content:
+        e.add_field(name="Content", value=codeblock(message.content), inline=False)
+    if message.attachments:
+        e.add_field(name="Attachments", value="\n".join(a.filename for a in message.attachments)[:900], inline=False)
+    e.set_footer(text=f"User ID: {message.author.id}")
+    await send_to(message.guild, "message_log", e)
+
+
+@bot.event
+async def on_bulk_message_delete(messages):
+    if not messages or is_private_channel(messages[0].channel):
+        return
+    e = make_embed("Bulk Delete", f"**{len(messages)}** messages were deleted in {messages[0].channel.mention}.", "warn")
+    await send_to(messages[0].guild, "message_log", e)
+
+
+async def structure_event(guild, title, color, action, target_id, name_text, group=False):
+    entry = await find_audit(guild, action, target_id)
+    executor = entry.user if entry else None
+    if executor and executor.id == bot.user.id:
+        return
+    e = make_embed(title, name_text, color)
+    e.add_field(name="By", value=executor.mention if executor else "Unknown")
+    await send_to(guild, "mod_log", e)
+    if group and executor:
+        await record_action(guild, executor, "channel/role deletion", name_text)
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    await structure_event(channel.guild, "Channel Created", "ok", discord.AuditLogAction.channel_create,
+                          channel.id, f"#{channel.name}")
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    await structure_event(channel.guild, "Channel Deleted", "bad", discord.AuditLogAction.channel_delete,
+                          channel.id, f"#{channel.name}", group=True)
+
+
+@bot.event
+async def on_guild_role_create(role):
+    await structure_event(role.guild, "Role Created", "ok", discord.AuditLogAction.role_create,
+                          role.id, f"@{role.name}")
+
+
+@bot.event
+async def on_guild_role_delete(role):
+    await structure_event(role.guild, "Role Deleted", "bad", discord.AuditLogAction.role_delete,
+                          role.id, f"@{role.name}", group=True)
 
 
 if __name__ == "__main__":
